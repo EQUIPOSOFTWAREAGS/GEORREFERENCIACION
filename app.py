@@ -1,29 +1,22 @@
 # app.py
 import io
-import os
 import json
-import time
-import hashlib
 import re
 import pathlib
-from typing import Optional, Tuple, Dict
+from typing import Optional, Dict
 
 import pandas as pd
 import numpy as np
-import requests
 import streamlit as st
 import folium
 from streamlit_folium import st_folium
 from folium.plugins import MarkerCluster
 
-from geopy.geocoders import Nominatim
-from geopy.extra.rate_limiter import RateLimiter
-
 from shapely.geometry import shape, Point
 
 
 # -------------------------
-# Configuración (QUEBRADANEGRA)
+# Configuración
 # -------------------------
 st.set_page_config(page_title="Georreferenciación - Quebradanegra (Cundinamarca)", layout="wide")
 
@@ -33,14 +26,12 @@ DEPARTAMENTO_NOMBRE = "Cundinamarca"
 QUEBRADANEGRA_CENTER = (5.1175, -74.4793)
 DEFAULT_ZOOM = 13
 
-CACHE_PATH = os.path.join(".cache", "geocode_cache.parquet")
+# ✅ Excel predeterminado en la carpeta principal (junto a app.py)
+DEFAULT_EXCEL_PATH = pathlib.Path("UBICACIONES.xlsx")
 
-# User-Agent obligatorio (Nominatim lo exige). Usa un contacto real.
-UA = "georreferenciacion-quebradanegra/1.0 (contacto: fabianan.ortizci@ecci.edu)"
-
-# Fallback local: crea este archivo en tu repo
-# data/quebradanegra.geojson
-LOCAL_GEOJSON_PATH = pathlib.Path("data/quebradanegra.geojson")
+# ✅ GeoJSON opcional en la carpeta principal (junto a app.py)
+# Si NO lo tienes, el mapa igual funciona pero no valida "dentro del municipio".
+LOCAL_GEOJSON_PATH = pathlib.Path("quebradanegra.geojson")
 
 
 # -------------------------
@@ -52,262 +43,16 @@ def _safe_str(x) -> str:
     return str(x).strip()
 
 
-def _hash_key(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()
-
-
-def ensure_cache_df(cache_path: str) -> pd.DataFrame:
-    if os.path.exists(cache_path):
-        try:
-            return pd.read_parquet(cache_path)
-        except Exception:
-            pass
-    return pd.DataFrame(columns=["addr_key", "address", "lat", "lon", "provider", "ts", "raw"])
-
-
-def save_cache_df(df_cache: pd.DataFrame, cache_path: str) -> None:
-    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-    df_cache.to_parquet(cache_path, index=False)
-
-
 def load_geojson_local(path: pathlib.Path) -> dict:
     if not path.exists():
         return {"type": "FeatureCollection", "features": []}
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        gj = json.loads(path.read_text(encoding="utf-8"))
+        if gj.get("type") == "Feature":
+            gj = {"type": "FeatureCollection", "features": [gj]}
+        return gj
     except Exception:
         return {"type": "FeatureCollection", "features": []}
-
-
-def nominatim_get_with_retry(url: str, params: dict, retries: int = 5) -> dict:
-    """
-    Nominatim en cloud suele dar 429/5xx. Esto reintenta con backoff.
-    Si falla, lanza HTTPError con información mínima.
-    """
-    headers = {"User-Agent": UA, "Accept": "application/json"}
-
-    last_status = None
-    last_text = ""
-    for i in range(retries):
-        r = requests.get(url, params=params, headers=headers, timeout=60)
-        last_status = r.status_code
-        last_text = (r.text or "")[:250]
-
-        if r.status_code in (429, 500, 502, 503, 504):
-            time.sleep(2 + i * 3)
-            continue
-
-        r.raise_for_status()
-        return r.json()
-
-    raise requests.HTTPError(f"Nominatim failed. status={last_status}, body={last_text}")
-
-
-@st.cache_data(show_spinner=False)
-def municipio_geojson(municipio: str, departamento: str) -> dict:
-    """
-    1) Intenta Nominatim (OSM) para obtener el polígono del municipio.
-    2) Si falla (rate limit/bloqueo), usa fallback local: data/quebradanegra.geojson
-    """
-    # --- intento Nominatim ---
-    try:
-        q = f"{municipio}, {departamento}, Colombia"
-        url = "https://nominatim.openstreetmap.org/search"
-        params = {"q": q, "format": "json", "limit": 1, "polygon_geojson": 1}
-        data = nominatim_get_with_retry(url, params=params, retries=5)
-
-        if data:
-            item = data[0]
-            geo = item.get("geojson")
-            if geo:
-                feature = {
-                    "type": "Feature",
-                    "properties": {
-                        "name": municipio,
-                        "state": departamento,
-                        "display_name": item.get("display_name", ""),
-                        "source": "nominatim",
-                    },
-                    "geometry": geo,
-                }
-                return {"type": "FeatureCollection", "features": [feature]}
-    except Exception as e:
-        # No rompemos la app
-        return {"type": "FeatureCollection", "features": [], "error": str(e)}
-
-    return {"type": "FeatureCollection", "features": []}
-
-
-# -------------------------
-# Normalización direcciones (solo si geocodificas)
-# -------------------------
-def normalize_address(raw: str) -> str:
-    s = _safe_str(raw).upper()
-    s = re.sub(r"\s+", " ", s).strip()
-    s = s.replace(" N ", " # ").replace(" NO ", " # ").replace(" NUM ", " # ")
-
-    replacements = {
-        "CLL": "CALLE",
-        "CL": "CALLE",
-        "CRA": "CARRERA",
-        "CR": "CARRERA",
-        "KR": "CARRERA",
-        "AK": "AVENIDA CARRERA",
-        "AC": "AVENIDA CALLE",
-        "AV": "AVENIDA",
-        "DG": "DIAGONAL",
-        "TV": "TRANSVERSAL",
-        "VDA": "VEREDA",
-        "VRD": "VEREDA",
-    }
-    for k, v in replacements.items():
-        s = re.sub(rf"\b{k}\b", v, s)
-
-    s = re.sub(r"\s*#\s*", " # ", s)
-    s = re.sub(r"\s*-\s*", "-", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-
-def build_address(row: pd.Series, address_col: str, extra_col: Optional[str]) -> str:
-    base = normalize_address(row.get(address_col, ""))
-    extra = normalize_address(row.get(extra_col, "")) if extra_col else ""
-
-    parts = []
-    if base and base not in {"NO APLICA", "N/A", "NA"}:
-        parts.append(base)
-    if extra and extra not in {"NO APLICA", "N/A", "NA"}:
-        parts.append(extra)
-
-    parts.extend([MUNICIPIO_NOMBRE.upper(), DEPARTAMENTO_NOMBRE.upper(), "COLOMBIA"])
-    return ", ".join([p for p in parts if p])
-
-
-# -------------------------
-# Geocodificación (opcional)
-# -------------------------
-def google_geocode(address: str, api_key: str) -> Tuple[Optional[float], Optional[float], Optional[str]]:
-    try:
-        url = "https://maps.googleapis.com/maps/api/geocode/json"
-        params = {"address": address, "key": api_key, "region": "co", "language": "es"}
-        r = requests.get(url, params=params, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        if data.get("status") != "OK":
-            return None, None, None
-        result = data["results"][0]
-        loc = result["geometry"]["location"]
-        return float(loc["lat"]), float(loc["lng"]), result.get("formatted_address")
-    except Exception:
-        return None, None, None
-
-
-def nominatim_geocode(address: str, geocode_fn) -> Tuple[Optional[float], Optional[float]]:
-    try:
-        loc = geocode_fn(address)
-        if loc:
-            return float(loc.latitude), float(loc.longitude)
-    except Exception:
-        return None, None
-    return None, None
-
-
-def geocode_dataframe_within_polygon(
-    df: pd.DataFrame,
-    address_col: str,
-    extra_col: Optional[str],
-    max_rows: int,
-    cache_path: str,
-    polygon,
-    provider: str,
-    google_api_key: str,
-    fallback_to_nominatim: bool,
-) -> pd.DataFrame:
-    df = df.copy()
-    if "lat" not in df.columns:
-        df["lat"] = np.nan
-    if "lon" not in df.columns:
-        df["lon"] = np.nan
-
-    df_cache = ensure_cache_df(cache_path)
-    cached = {row["addr_key"]: (row["lat"], row["lon"]) for _, row in df_cache.iterrows()}
-
-    geocode_fn = None
-    if provider == "nominatim" or fallback_to_nominatim:
-        geolocator = Nominatim(user_agent=UA)
-        geocode_fn = RateLimiter(geolocator.geocode, min_delay_seconds=1)
-
-    pending = df[df["lat"].isna()].head(max_rows)
-    prog = st.progress(0, text=f"Geocodificando (forzando dentro de {MUNICIPIO_NOMBRE})...")
-    total = len(pending) if len(pending) > 0 else 1
-
-    for i, (idx, row) in enumerate(pending.iterrows(), start=1):
-        addr1 = build_address(row, address_col, extra_col)
-        if not addr1.strip():
-            continue
-
-        key1 = _hash_key(addr1)
-        lat, lon, raw = None, None, None
-
-        if key1 in cached:
-            lat, lon = cached[key1]
-        else:
-            if provider == "google":
-                if google_api_key:
-                    lat, lon, raw = google_geocode(addr1, google_api_key)
-            else:
-                lat, lon = nominatim_geocode(addr1, geocode_fn)
-
-            if (lat is None or lon is None) and fallback_to_nominatim and geocode_fn:
-                lat2, lon2 = nominatim_geocode(addr1, geocode_fn)
-                if lat2 is not None and lon2 is not None:
-                    lat, lon = lat2, lon2
-                    if raw is None:
-                        raw = "fallback_nominatim"
-
-            df_cache = pd.concat(
-                [df_cache, pd.DataFrame([{
-                    "addr_key": key1,
-                    "address": addr1,
-                    "lat": lat,
-                    "lon": lon,
-                    "provider": provider if raw is None else str(raw),
-                    "ts": int(time.time()),
-                    "raw": raw,
-                }])],
-                ignore_index=True
-            )
-            cached[key1] = (lat, lon)
-
-        inside = False
-        if lat is not None and lon is not None and not (pd.isna(lat) or pd.isna(lon)):
-            inside = polygon.contains(Point(float(lon), float(lat)))
-
-        if inside:
-            df.at[idx, "lat"] = lat
-            df.at[idx, "lon"] = lon
-        else:
-            df.at[idx, "lat"] = np.nan
-            df.at[idx, "lon"] = np.nan
-
-        prog.progress(i / total, text=f"Geocodificando {i}/{len(pending)}")
-
-    save_cache_df(df_cache, cache_path)
-    return df
-
-
-def keep_only_inside_polygon(df_in: pd.DataFrame, poly) -> pd.DataFrame:
-    df = df_in.copy()
-    mask = []
-    for _, r in df.iterrows():
-        lat, lon = r.get("lat"), r.get("lon")
-        ok = False
-        if lat is not None and lon is not None and not (pd.isna(lat) or pd.isna(lon)):
-            ok = poly.contains(Point(float(lon), float(lat)))
-        mask.append(ok)
-
-    df.loc[~pd.Series(mask, index=df.index), ["lat", "lon"]] = np.nan
-    return df
 
 
 # -------------------------
@@ -328,6 +73,7 @@ SERVICE_STYLES = {
 def normalize_service(x: str) -> str:
     s = _safe_str(x).upper()
     s = re.sub(r"\s+", " ", s).strip()
+
     if s in SERVICE_STYLES:
         return s
     if "SALUD" in s:
@@ -372,19 +118,24 @@ def add_legend(m: folium.Map) -> None:
     m.get_root().html.add_child(folium.Element(html))
 
 
-# -------------------------
-# Mapa
-# -------------------------
-def make_map(
-    df_points: pd.DataFrame,
-    municipio_gj: dict,
-    service_col: str,
-    icon_png_map: Dict[str, Optional[bytes]],
-) -> folium.Map:
+def keep_only_inside_polygon(df_in: pd.DataFrame, poly) -> pd.DataFrame:
+    df = df_in.copy()
+    ok = []
+    for _, r in df.iterrows():
+        lat, lon = r.get("lat"), r.get("lon")
+        inside = False
+        if lat is not None and lon is not None and not (pd.isna(lat) or pd.isna(lon)):
+            inside = poly.contains(Point(float(lon), float(lat)))
+        ok.append(inside)
+    df.loc[~pd.Series(ok, index=df.index), ["lat", "lon"]] = np.nan
+    return df
+
+
+def make_map(df_points: pd.DataFrame, municipio_gj: dict) -> folium.Map:
     pts = df_points.dropna(subset=["lat", "lon"]).copy()
 
     if len(pts) > 0:
-        center = (float(pts["lat"].astype(float).mean()), float(pts["lon"].astype(float).mean()))
+        center = (float(pts["lat"].mean()), float(pts["lon"].mean()))
         zoom = 13
     else:
         center = QUEBRADANEGRA_CENTER
@@ -392,34 +143,26 @@ def make_map(
 
     m = folium.Map(location=center, zoom_start=zoom, control_scale=True)
 
-    folium.GeoJson(
-        municipio_gj,
-        name=f"Municipio {MUNICIPIO_NOMBRE}",
-        style_function=lambda feature: {
-            "fillColor": "#2E7D32",
-            "color": "#1B5E20",
-            "weight": 2,
-            "fillOpacity": 0.15,
-        },
-    ).add_to(m)
+    # Polígono (si existe)
+    if municipio_gj.get("features"):
+        folium.GeoJson(
+            municipio_gj,
+            name=f"Municipio {MUNICIPIO_NOMBRE}",
+            style_function=lambda feature: {
+                "fillColor": "#2E7D32",
+                "color": "#1B5E20",
+                "weight": 2,
+                "fillOpacity": 0.15,
+            },
+        ).add_to(m)
 
     cluster = MarkerCluster(name="Puntos").add_to(m)
 
-    if service_col and service_col in pts.columns:
-        pts["_SERVICIO"] = pts[service_col].apply(normalize_service)
-    else:
-        pts["_SERVICIO"] = "OTRO"
-
     for _, r in pts.iterrows():
-        servicio = _safe_str(r.get("_SERVICIO", "OTRO")) or "OTRO"
+        servicio = normalize_service(r.get("TIPO_SERVICIO", "OTRO"))
         style = SERVICE_STYLES.get(servicio, SERVICE_STYLES["OTRO"])
 
-        label = (
-            _safe_str(r.get("NOMBRE", ""))
-            or _safe_str(r.get("DIRECCION", ""))
-            or _safe_str(r.get("address_full", ""))
-            or "Sitio"
-        )
+        label = _safe_str(r.get("SITIO", "")) or _safe_str(r.get("Direccion", "")) or "Sitio"
 
         popup = f"""
         <b>{label}</b><br>
@@ -428,23 +171,11 @@ def make_map(
         <b>Lon:</b> {float(r["lon"]):.6f}
         """
 
-        if servicio in icon_png_map and icon_png_map[servicio] is not None:
-            icon = folium.CustomIcon(
-                icon_image=icon_png_map[servicio],
-                icon_size=(28, 28),
-                icon_anchor=(14, 14),
-            )
-            folium.Marker(
-                location=(float(r["lat"]), float(r["lon"])),
-                popup=folium.Popup(popup, max_width=350),
-                icon=icon,
-            ).add_to(cluster)
-        else:
-            folium.Marker(
-                location=(float(r["lat"]), float(r["lon"])),
-                popup=folium.Popup(popup, max_width=350),
-                icon=folium.Icon(color=style["color"], icon=style["icon"], prefix="fa"),
-            ).add_to(cluster)
+        folium.Marker(
+            location=(float(r["lat"]), float(r["lon"])),
+            popup=folium.Popup(popup, max_width=350),
+            icon=folium.Icon(color=style["color"], icon=style["icon"], prefix="fa"),
+        ).add_to(cluster)
 
     add_legend(m)
     folium.LayerControl().add_to(m)
@@ -454,265 +185,137 @@ def make_map(
 # -------------------------
 # UI
 # -------------------------
-st.title("Georreferenciar servicios sociales (Quebradanegra, Cundinamarca)")
+st.title("Servicios sociales georreferenciados - Quebradanegra (Cundinamarca)")
 
 with st.sidebar:
-    st.header("Entrada")
-    uploaded = st.file_uploader("Sube tu Excel (.xlsx)", type=["xlsx"])
+    st.header("Datos")
+    uploaded = st.file_uploader("Sube otro Excel (opcional)", type=["xlsx"])
+    st.caption("Si NO subes nada, se usa UBICACIONES.xlsx en la carpeta principal.")
 
-    st.header("Polígono (fallback)")
-    st.caption("Si Nominatim falla en Streamlit Cloud, sube aquí el GeoJSON del municipio.")
+    st.header("Polígono municipal (opcional)")
     uploaded_geojson = st.file_uploader("Subir GeoJSON (Feature/FeatureCollection)", type=["geojson", "json"])
 
-    st.header("Proveedor de geocodificación (solo si NO tienes lat/lon)")
-    provider = st.selectbox("Proveedor", options=["google", "nominatim"], index=0)
-    google_api_key = st.text_input("Google API Key (si usas Google)", type="password")
-    fallback_to_nominatim = st.checkbox("Fallback a Nominatim si falla Google", value=True)
-
-    st.header("Ejecución")
-    max_rows = st.number_input("Máximo de filas a geocodificar por ejecución", min_value=10, max_value=5000, value=300, step=50)
-    run_geocode = st.checkbox("Ejecutar geocodificación (si NO tienes lat/lon)", value=False)
-
-    st.header("Logos PNG por tipo (opcional)")
-    st.caption("Si subes un PNG, se usará como ícono para ese tipo de servicio.")
-    icon_png_map: Dict[str, Optional[bytes]] = {}
-    for k in SERVICE_STYLES.keys():
-        if k == "OTRO":
-            continue
-        f = st.file_uploader(f"Logo PNG para {k}", type=["png"], key=f"logo_{k}")
-        icon_png_map[k] = f.getvalue() if f is not None else None
-
     st.header("Salida")
-    enable_download = st.checkbox("Permitir descarga del Excel", value=True)
+    enable_download = st.checkbox("Permitir descarga", value=True)
 
-if not uploaded:
-    st.info("Sube un Excel para comenzar.")
-    st.stop()
-
-df = pd.read_excel(uploaded)
-st.subheader("Vista previa")
-st.dataframe(df.head(25), use_container_width=True)
-
-cols = df.columns.tolist()
-
-def find_col(candidates):
-    lower = {c.lower(): c for c in cols}
-    for cand in candidates:
-        if cand in lower:
-            return lower[cand]
-    return None
-
-lat_col = find_col(["lat", "latitude", "y"])
-lon_col = find_col(["lon", "lng", "longitude", "x"])
-
-st.subheader("Configuración de columnas")
-address_col = st.selectbox("Columna de dirección (si aplica)", options=cols, index=0)
-
-extra_col_opt = ["(ninguna)"] + cols
-extra_col_choice = st.selectbox("Columna opcional de complemento (vereda/barrio/etc.)", options=extra_col_opt, index=0)
-extra_col = None if extra_col_choice == "(ninguna)" else extra_col_choice
-
-service_col_opt = ["(ninguna)"] + cols
-service_col_choice = st.selectbox("Columna de TIPO DE SERVICIO", options=service_col_opt, index=0)
-service_col = None if service_col_choice == "(ninguna)" else service_col_choice
+# -------------------------
+# 1) Cargar Excel: upload o default (SIN carpeta data/)
+# -------------------------
+if uploaded is not None:
+    df = pd.read_excel(uploaded)
+    st.info("Usando Excel cargado por el usuario.")
+else:
+    if not DEFAULT_EXCEL_PATH.exists():
+        st.error("No se encontró UBICACIONES.xlsx en la carpeta principal (junto a app.py).")
+        st.stop()
+    df = pd.read_excel(DEFAULT_EXCEL_PATH)
+    st.success("Usando Excel predeterminado del aplicativo (UBICACIONES.xlsx).")
 
 df = df.copy()
 
-# Coordenadas directas
-if lat_col and lon_col:
-    df["lat"] = pd.to_numeric(df[lat_col], errors="coerce")
-    df["lon"] = pd.to_numeric(df[lon_col], errors="coerce")
-    st.success(f"Detecté coordenadas: lat='{lat_col}', lon='{lon_col}'.")
-else:
-    df["lat"] = np.nan
-    df["lon"] = np.nan
-    st.warning("No detecté columnas lat/lon. Si quieres coordenadas, activa geocodificación con dirección.")
+# -------------------------
+# 2) Normalizar columnas (tu archivo real)
+# -------------------------
+# En tu archivo el tipo está en "Unnamed: 2"
+if "TIPO_SERVICIO" not in df.columns:
+    if "Unnamed: 2" in df.columns:
+        df = df.rename(columns={"Unnamed: 2": "TIPO_SERVICIO"})
+    elif "TIPO" in df.columns:
+        df = df.rename(columns={"TIPO": "TIPO_SERVICIO"})
 
-# Limpieza básica: evita coordenadas imposibles
+# Asegurar lat/lon
+df["lat"] = pd.to_numeric(df.get("lat"), errors="coerce")
+df["lon"] = pd.to_numeric(df.get("lon"), errors="coerce")
+
+# Limpiar coordenadas imposibles (Colombia)
 df.loc[(df["lat"] < -5) | (df["lat"] > 15), ["lat", "lon"]] = np.nan
 df.loc[(df["lon"] < -82) | (df["lon"] > -66), ["lat", "lon"]] = np.nan
 
-# Construir address_full
-df["address_full"] = df.apply(lambda r: build_address(r, address_col, extra_col), axis=1)
+# Servicio normalizado
+df["TIPO_SERVICIO"] = df.get("TIPO_SERVICIO", "OTRO").apply(normalize_service)
 
 # -------------------------
-# Polígono del municipio: Nominatim -> archivo local -> subida manual
+# ✅ 3) MOSTRAR PRIMERO LOS DATOS (lo que pediste)
 # -------------------------
-with st.spinner("Cargando polígono del municipio (Nominatim / local / upload)..."):
-    municipio_gj = municipio_geojson(MUNICIPIO_NOMBRE, DEPARTAMENTO_NOMBRE)
+st.subheader("Datos cargados (primero)")
+st.dataframe(df, use_container_width=True)
 
-# Si Nominatim falló, intenta local
-if not municipio_gj.get("features"):
-    # Mensaje del error (si existe)
-    if municipio_gj.get("error"):
-        st.warning(f"Nominatim falló: {municipio_gj['error']}")
+# -------------------------
+# 4) Cargar polígono: upload -> local (ambos en raíz)
+# -------------------------
+municipio_gj = {"type": "FeatureCollection", "features": []}
 
-    local_gj = load_geojson_local(LOCAL_GEOJSON_PATH)
-    if local_gj.get("type") == "Feature":
-        local_gj = {"type": "FeatureCollection", "features": [local_gj]}
-    if local_gj.get("features"):
-        municipio_gj = local_gj
-        st.info("Usando polígono local: data/quebradanegra.geojson")
-
-# Si tampoco hay local, usa upload manual
-if not municipio_gj.get("features"):
-    if uploaded_geojson is None:
-        st.error("No se pudo cargar el polígono. Sube un GeoJSON en la barra lateral o crea data/quebradanegra.geojson en el repo.")
-        st.stop()
+if uploaded_geojson is not None:
     try:
         municipio_gj = json.loads(uploaded_geojson.getvalue().decode("utf-8"))
         if municipio_gj.get("type") == "Feature":
             municipio_gj = {"type": "FeatureCollection", "features": [municipio_gj]}
-        if not municipio_gj.get("features"):
-            st.error("El GeoJSON subido no trae features.")
-            st.stop()
         st.success("Polígono cargado desde archivo subido.")
     except Exception:
-        st.error("El archivo GeoJSON subido no es válido.")
+        st.error("GeoJSON subido inválido.")
         st.stop()
-
-municipio_poly = shape(municipio_gj["features"][0]["geometry"])
-
-# -------------------------
-# Geocodificación (opcional)
-# -------------------------
-if run_geocode:
-    if lat_col and lon_col:
-        st.info("Tu Excel ya trae lat/lon; no se ejecutó geocodificación.")
-    else:
-        if provider == "google" and not google_api_key:
-            st.error("Seleccionaste Google pero no ingresaste API Key.")
-            st.stop()
-
-        with st.spinner(f"Geocodificando y forzando dentro de {MUNICIPIO_NOMBRE}..."):
-            df = geocode_dataframe_within_polygon(
-                df=df,
-                address_col=address_col,
-                extra_col=extra_col,
-                max_rows=int(max_rows),
-                cache_path=CACHE_PATH,
-                polygon=municipio_poly,
-                provider=provider,
-                google_api_key=google_api_key,
-                fallback_to_nominatim=fallback_to_nominatim,
-            )
-        st.success("Geocodificación completada (o parcial según el límite).")
-
-# Invalidar fuera del municipio
-df = keep_only_inside_polygon(df, municipio_poly)
-
-# Tipo normalizado
-if service_col and service_col in df.columns:
-    df["_SERVICIO"] = df[service_col].apply(normalize_service)
 else:
-    df["_SERVICIO"] = "OTRO"
+    municipio_gj = load_geojson_local(LOCAL_GEOJSON_PATH)
+    if municipio_gj.get("features"):
+        st.info("Usando polígono local: quebradanegra.geojson (en la carpeta principal).")
+    else:
+        st.warning("No hay polígono local en raíz. El mapa funcionará, pero NO validará 'dentro del municipio'.")
+
+# -------------------------
+# 5) Validación dentro del polígono (si existe)
+# -------------------------
+if municipio_gj.get("features"):
+    municipio_poly = shape(municipio_gj["features"][0]["geometry"])
+    df = keep_only_inside_polygon(df, municipio_poly)
 
 total = len(df)
 with_coords = df.dropna(subset=["lat", "lon"]).shape[0]
-st.write(f"Registros: **{total:,}** | Dentro de {MUNICIPIO_NOMBRE} (con coords): **{with_coords:,}**")
+st.write(f"Registros: **{total:,}** | Con coordenadas válidas: **{with_coords:,}**")
 
 # -------------------------
-# Filtros
+# 6) Filtros rápidos
 # -------------------------
 st.subheader("Filtros")
-colA, colB, colC = st.columns([1, 1, 1.2])
+col1, col2 = st.columns([1, 1])
 
-servicios_disponibles = sorted(df["_SERVICIO"].dropna().unique().tolist())
-with colA:
-    filtro_servicios = st.multiselect("Tipos de servicio", options=servicios_disponibles, default=servicios_disponibles)
+with col1:
+    servicios = sorted(df["TIPO_SERVICIO"].dropna().unique().tolist())
+    sel_serv = st.multiselect("Tipos de servicio", servicios, default=servicios)
 
-vereda_col = None
-for cand in ["VEREDA", "Vereda", "vereda"]:
-    if cand in df.columns:
-        vereda_col = cand
-        break
+with col2:
+    q = st.text_input("Buscar por SITIO", value="").strip().lower()
 
-with colB:
-    if vereda_col:
-        veredas = sorted(df[vereda_col].dropna().astype(str).unique().tolist())
-        filtro_veredas = st.multiselect("Veredas", options=veredas, default=veredas)
-    else:
-        filtro_veredas = None
-        st.caption("No se detectó columna VEREDA (opcional).")
-
-with colC:
-    q = st.text_input("Buscar (nombre/dirección)", value="").strip().lower()
-
-df_f = df.copy()
-df_f = df_f[df_f["_SERVICIO"].isin(filtro_servicios)]
-
-if vereda_col and filtro_veredas is not None:
-    df_f = df_f[df_f[vereda_col].astype(str).isin(filtro_veredas)]
-
-if q:
-    cols_busqueda = [c for c in ["NOMBRE", "DIRECCION", "address_full"] if c in df_f.columns]
-    if cols_busqueda:
-        mask = np.zeros(len(df_f), dtype=bool)
-        for c in cols_busqueda:
-            mask |= df_f[c].astype(str).str.lower().str.contains(q, na=False)
-        df_f = df_f[mask]
+df_f = df[df["TIPO_SERVICIO"].isin(sel_serv)].copy()
+if q and "SITIO" in df_f.columns:
+    df_f = df_f[df_f["SITIO"].astype(str).str.lower().str.contains(q, na=False)]
 
 # -------------------------
-# Conteo + mapa
+# 7) Conteo y mapa
 # -------------------------
-st.subheader("Conteo por tipo (según filtros, solo puntos válidos)")
-conteo_serv = (
+st.subheader("Conteo por tipo (según filtros)")
+conteo = (
     df_f.dropna(subset=["lat", "lon"])
-    .groupby("_SERVICIO")
+    .groupby("TIPO_SERVICIO")
     .size()
     .reset_index(name="sitios")
     .sort_values("sitios", ascending=False)
 )
-st.dataframe(conteo_serv, use_container_width=True)
+st.dataframe(conteo, use_container_width=True)
 
-st.subheader("Mapa: polígono municipal + puntos por tipo (iconos/logos)")
-m = make_map(df_f, municipio_gj, service_col=service_col or "", icon_png_map=icon_png_map)
+st.subheader("Mapa")
+m = make_map(df_f, municipio_gj)
 st_folium(m, width=1100, height=650)
 
-st.subheader("Resultados (muestra - según filtros)")
-out_cols = []
-for c in ["NOMBRE", "DIRECCION"]:
-    if c in df_f.columns:
-        out_cols.append(c)
-if address_col in df_f.columns and address_col not in out_cols:
-    out_cols.append(address_col)
-if extra_col and extra_col in df_f.columns:
-    out_cols.append(extra_col)
-if vereda_col and vereda_col in df_f.columns:
-    out_cols.append(vereda_col)
-if service_col and service_col in df_f.columns:
-    out_cols.append(service_col)
-
-out_cols += ["_SERVICIO", "lat", "lon", "address_full"]
-out_cols = [c for c in out_cols if c in df_f.columns]
-out_cols = list(dict.fromkeys(out_cols))
-
-st.dataframe(df_f[out_cols].head(300), use_container_width=True)
-
 # -------------------------
-# Descarga
+# 8) Descarga
 # -------------------------
 if enable_download:
-    c1, c2 = st.columns(2)
-
-    with c1:
-        output_all = io.BytesIO()
-        with pd.ExcelWriter(output_all, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name="todo")
-        st.download_button(
-            "Descargar TODO",
-            data=output_all.getvalue(),
-            file_name="quebradanegra_servicios_todo.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-
-    with c2:
-        output_f = io.BytesIO()
-        with pd.ExcelWriter(output_f, engine="openpyxl") as writer:
-            df_f.to_excel(writer, index=False, sheet_name="filtrado")
-        st.download_button(
-            "Descargar FILTRADO",
-            data=output_f.getvalue(),
-            file_name="quebradanegra_servicios_filtrado.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df_f.to_excel(writer, index=False, sheet_name="filtrado")
+    st.download_button(
+        "Descargar Excel (filtrado)",
+        data=output.getvalue(),
+        file_name="quebradanegra_servicios_filtrado.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
