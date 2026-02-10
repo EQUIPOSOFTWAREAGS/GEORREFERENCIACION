@@ -1,9 +1,20 @@
-streamlit
-pandas
-numpy
-openpyxl
-folium
-streamlit-folium
-requests
-shapely
-geopy
+# --- Core app ---
+streamlit==1.31.1
+
+# --- Data handling ---
+pandas==2.2.1
+numpy==1.26.4
+openpyxl==3.1.2
+pyarrow==15.0.0
+
+# --- HTTP / APIs ---
+requests==2.31.0
+
+# --- Geospatial ---
+folium==0.15.1
+streamlit-folium==0.18.0
+geopy==2.4.1
+shapely==2.0.3
+
+# --- Optional (recommended for stability) ---
+python-dateutil==2.9.0.post0
